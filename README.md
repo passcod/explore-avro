@@ -16,7 +16,7 @@ cargo install --git https://github.com/passcod/explore-avro explore-avro
 
 ```shell
 > # Retrieve all columns for a list of records
-> ravro get test.avro
+> explore-avro get test.avro
 
 +-----------+--------------+-----+
 | firstName | lastName     | age |
@@ -31,7 +31,7 @@ cargo install --git https://github.com/passcod/explore-avro explore-avro
 +-----------+--------------+-----+
 
 > # Search (using regular expressions)
-> ravro get test.avro --search McFly
+> explore-avro get test.avro --search McFly
 
 +-----------+--------------+-----+
 | firstName | lastName     | age |
@@ -42,7 +42,7 @@ cargo install --git https://github.com/passcod/explore-avro explore-avro
 +-----------+--------------+-----+
 
 > # Select only some columns
-> ravro get test.avro --fields firstName age
+> explore-avro get test.avro --fields firstName age
 
 +-----------+-----+
 | firstName | age |
@@ -57,7 +57,7 @@ cargo install --git https://github.com/passcod/explore-avro explore-avro
 +-----------+-----+
 
 > # Select the first 2 columns
-> ravro get test*.avro --fields firstName age --take 2
+> explore-avro get test*.avro --fields firstName age --take 2
 
 +-----------+-----+
 | firstName | age |
@@ -68,14 +68,14 @@ cargo install --git https://github.com/passcod/explore-avro explore-avro
 +-----------+-----+
 
 > # Output as CSV
-> ravro get test*.avro --fields firstName age --take 2 --format csv
+> explore-avro get test*.avro --fields firstName age --take 2 --format csv
 
 firstName,age
 Marty,24
 Biff,72
 
 > # Output as JSON
-> ravro get test*.avro --fields firstName age --take 2 --format csv
+> explore-avro get test*.avro --fields firstName age --take 2 --format csv
 
 {"firstName":"Marty","age":24}
 {"firstName":"Biff","age":72}
