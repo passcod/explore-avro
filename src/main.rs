@@ -1,76 +1,73 @@
-///! # rargo
-///!
-///! A CLI for manipulating [AVRO](https://avro.apache.org/) files.
-///!
-///! This crate currently expects each line to be a [Record](https://avro.apache.org/docs/1.8.1/spec.html#schema_record).
-use failure::Error;
+use std::io::Write;
+
+use avro_value::AvroValue;
+use clap::Parser;
+use cli::{AvroColumnarValue, AvroData, CliService};
+use miette::{bail, IntoDiagnostic as _, Result, WrapErr as _};
 use prettytable::{color, Attr, Cell, Row, Table};
 use regex::Regex;
-use structopt::StructOpt;
-use cli::{CliService, AvroColumnarValue, AvroData};
-use avro_value::AvroValue;
 
 mod avro_value;
 mod cli;
 
-#[derive(StructOpt, Debug)]
-#[structopt(name = "ravro")]
+/// A CLI for exploring [Apache Avro](https://avro.apache.org/) files.
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
 enum RavroArgs {
-    #[structopt(name = "get")]
     /// Get fields from an Avro file
     Get {
         /// Files to process
         path: String,
 
         /// Names of the fields to get to get
-        #[structopt(short = "f", long = "fields")]
+        #[arg(short, long = "fields")]
         fields_to_get: Vec<String>,
 
-        /// Codec to uncompress with.
-        /// Can be omitted or "deflate"
-        #[structopt(short = "c", long = "codec")]
-        codec: Option<String>,
-
         /// Regex to search. Only a row with a matching field will appear in the outputted table
-        #[structopt(short = "s", long = "search")]
+        #[arg(short, long = "search")]
         search: Option<String>,
 
         /// Maximum number of records to show
-        #[structopt(short = "t", long = "take")]
+        #[arg(short, long = "take")]
         take: Option<u32>,
 
         /// Output format.
-        /// Omit for pretty table output, or specify: "csv"
-        #[structopt(short = "p", long = "format")]
-        output_format: Option<String>
+        ///
+        /// Omit for pretty table output, or specify: `csv`, `json`, `json-pretty`.
+        #[arg(short = 'p', long = "format")]
+        output_format: Option<String>,
     },
 }
 
-fn main() -> Result<(), Error> {
-    match RavroArgs::from_args() {
+fn main() -> Result<()> {
+    match RavroArgs::parse() {
         RavroArgs::Get {
             fields_to_get,
             path,
             search,
-            codec,
             take,
-            output_format
+            output_format,
         } => {
-            let avro = CliService::from(path, codec);
+            let mut avro = CliService::from(path)?;
             let fields_to_get = if fields_to_get.is_empty() {
-                avro.get_all_field_names()
+                avro.get_all_field_names()?
             } else {
                 fields_to_get
             };
 
-            let data = avro.get_fields(&fields_to_get, take);
+            let data = avro.get_fields(&fields_to_get, take)?;
 
             match output_format {
-                None => print_as_table(&fields_to_get, data, search),
+                None => print_as_table(&fields_to_get, data, search)?,
                 Some(format_option) => match format_option.as_ref() {
-                    "csv" => print_as_csv(&fields_to_get, data).expect("Could not print Avro as CSV"),
-                    _ => panic!("Output format not recognized")
-                }
+                    "csv" => print_as_csv(&fields_to_get, data)
+                        .wrap_err("Could not print Avro as CSV")?,
+                    "json" => print_as_json(&fields_to_get, data, false)
+                        .wrap_err("Could not print Avro as JSON")?,
+                    "json-pretty" => print_as_json(&fields_to_get, data, true)
+                        .wrap_err("Could not print Avro as JSON")?,
+                    _ => bail!("Output format not recognized"),
+                },
             }
         }
     }
@@ -78,8 +75,13 @@ fn main() -> Result<(), Error> {
     Ok(())
 }
 
-fn print_as_table(field_names: &[String], data: AvroData, search: Option<String>) {
+fn print_as_table(field_names: &[String], data: AvroData, search: Option<String>) -> Result<()> {
     let mut table = Table::new();
+
+    let search = match search {
+        None => None,
+        Some(re) => Some(Regex::new(&re).into_diagnostic()?),
+    };
 
     let header_cells: Vec<Cell> = field_names
         .iter()
@@ -98,11 +100,7 @@ fn print_as_table(field_names: &[String], data: AvroData, search: Option<String>
             r.iter()
                 .find(|v| match &search {
                     None => true,
-                    Some(search) => {
-                        let search =
-                            Regex::new(&search).expect("Regular expression is invalid");
-                        search.is_match(&v.value().to_string())
-                    }
+                    Some(search) => search.is_match(&v.value().to_string()),
                 })
                 .is_some()
         })
@@ -115,8 +113,6 @@ fn print_as_table(field_names: &[String], data: AvroData, search: Option<String>
                 let value_str = v.value().to_string();
                 let mut cell = Cell::new(&value_str);
                 if let Some(search) = &search {
-                    let search =
-                        Regex::new(&search).expect("Regular expression is invalid");
                     if search.is_match(&value_str) {
                         cell.style(Attr::Bold);
                         cell.style(Attr::ForegroundColor(color::GREEN));
@@ -135,18 +131,47 @@ fn print_as_table(field_names: &[String], data: AvroData, search: Option<String>
     }
 
     table.printstd();
+    Ok(())
 }
 
-fn print_as_csv(field_names: &[String], data: AvroData) -> Result<(), Box<dyn std::error::Error>> {
-    let mut csv_writer = csv::Writer::from_writer(std::io::stdout());
+fn print_as_csv(field_names: &[String], data: AvroData) -> Result<()> {
+    let mut writer = csv::Writer::from_writer(std::io::stdout());
 
     // Headers
-    csv_writer.write_record(field_names)?;
+    writer.write_record(field_names).into_diagnostic()?;
 
     for row in data {
-        csv_writer.write_record(row.iter().map(|val: &AvroColumnarValue| val.value().to_string()).collect::<Vec<String>>())?;
+        writer
+            .write_record(
+                row.iter()
+                    .map(|val: &AvroColumnarValue| val.value().to_string())
+                    .collect::<Vec<String>>(),
+            )
+            .into_diagnostic()?;
     }
 
-    csv_writer.flush()?;
+    writer.flush().into_diagnostic()?;
+    Ok(())
+}
+
+fn print_as_json(field_filter: &[String], data: AvroData, pretty: bool) -> Result<()> {
+    let mut stdout = std::io::stdout();
+    for row in data {
+        let obj = serde_json::Value::Object(
+            row.iter()
+                .filter(|val| field_filter.iter().any(|f| val.name() == f))
+                .map(|val: &AvroColumnarValue| {
+                    val.value().to_json().map(|v| (val.name().to_owned(), v))
+                })
+                .collect::<Result<serde_json::Map<String, serde_json::Value>>>()?,
+        );
+
+        if pretty {
+            serde_json::to_writer_pretty(&mut stdout, &obj).into_diagnostic()?;
+        } else {
+            serde_json::to_writer(&mut stdout, &obj).into_diagnostic()?;
+        }
+        writeln!(&mut stdout, "").into_diagnostic()?;
+    }
     Ok(())
 }

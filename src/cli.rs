@@ -1,16 +1,16 @@
-use avro_rs::types::Value;
-use avro_rs::{Codec, Reader};
-use glob::glob;
-use std::fs;
-use std::path::PathBuf;
 use crate::avro_value::AvroValue;
+use apache_avro::{types::Value, Reader};
+use glob::glob;
+use miette::{bail, miette, IntoDiagnostic, Result, WrapErr as _};
+use std::fs::File;
+use std::io::Seek;
+use std::path::PathBuf;
 
-pub(crate) const CODEC_DEFLATE: &'static str = "deflate";
 pub(crate) type AvroData = Vec<Vec<AvroColumnarValue>>;
 
 #[derive(Debug)]
 pub(crate) struct AvroFile {
-    data: Vec<u8>,
+    file: File,
     path: PathBuf,
 }
 
@@ -22,12 +22,16 @@ pub(crate) struct CliService {
 #[derive(Debug, Clone)]
 pub(crate) struct AvroColumnarValue {
     name: String,
-    value: AvroValue
+    value: AvroValue,
 }
 
 impl AvroColumnarValue {
     pub fn from(name: String, value: AvroValue) -> Self {
         AvroColumnarValue { name, value }
+    }
+    
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn value(&self) -> &AvroValue {
@@ -41,98 +45,108 @@ impl CliService {
     /// # Arguments
     ///
     /// * `path` - A glob to match against Avro files to load
-    /// * `codec` - A codec for decompression
-    pub fn from(path: String, codec: Option<String>) -> Self {
+    pub fn from(path: String) -> Result<Self> {
         let mut paths: Vec<PathBuf> = Vec::new();
-        for entry in glob(&path).expect("Failed to read glob pattern") {
+        for entry in glob(&path)
+            .into_diagnostic()
+            .wrap_err("Failed to read glob pattern")?
+        {
             match entry {
                 Ok(p) => paths.push(p),
-                Err(e) => panic!("{:?}", e),
+                Err(e) => bail!("{:?}", e),
             }
         }
 
         if paths.len() == 0 {
-            panic!("No files found");
-        }
-
-        // TODO: Add `Codec::Snappy`
-        let mut codec_for_decompressing: Codec = Codec::Null;
-        if let Some(c) = codec {
-            if c == CODEC_DEFLATE {
-                codec_for_decompressing = Codec::Deflate;
-            }
+            bail!("No files found");
         }
 
         let mut files: Vec<AvroFile> = Vec::new();
         for path in paths {
-            let mut data =
-                fs::read(&path).expect(&format!("Could not read from path {0}", path.display()));
-            codec_for_decompressing.decompress(&mut data).expect("Could not successfully decompress Avro file. Make sure that the codec you specified is correct");
-            files.push(AvroFile { data, path });
+            let file = File::open(&path)
+                .into_diagnostic()
+                .wrap_err("Could not open file")?;
+            files.push(AvroFile { file, path });
         }
 
-        CliService { files }
+        Ok(CliService { files })
     }
 
     /// Get all the names of the columns.
     /// Relies on the first record
-    pub fn get_all_field_names(&self) -> Vec<String> {
-        let first_file = &self.files[0];
-        let mut reader = Reader::new(&first_file.data[..]).expect(&format!(
-            "Could not read Avro file {}",
-            first_file.path.display()
-        ));
-        if let Ok(Value::Record(fields)) = reader
-            .next()
-            .expect("Avro must have at least one record row to infer schema")
-        {
-            fields
-                .iter()
-                .map(|(f, _)| f.to_owned())
-                .collect::<Vec<String>>()
-        } else {
-            Vec::new()
-        }
+    pub fn get_all_field_names(&mut self) -> Result<Vec<String>> {
+        let first_file = &mut self.files[0];
+        first_file
+            .file
+            .seek(std::io::SeekFrom::Start(0))
+            .into_diagnostic()?;
+        let mut reader = Reader::new(&first_file.file)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("Could not read Avro file {}", first_file.path.display()))?;
+        Ok(
+            if let Ok(Value::Record(fields)) = reader.next().ok_or(miette!(
+                "Avro must have at least one record row to infer schema"
+            ))? {
+                fields
+                    .iter()
+                    .map(|(f, _)| f.to_owned())
+                    .collect::<Vec<String>>()
+            } else {
+                Vec::new()
+            },
+        )
     }
 
     /// Get all columns and values
-    /// 
+    ///
     /// # Arguments
     /// * `fields_to_get` - Names of the columns to retrieve
     /// * `take` - Number of rows to take
-    pub fn get_fields(&self, fields_to_get: &[String], take: Option<u32>) -> Vec<Vec<AvroColumnarValue>> {
+    pub fn get_fields(
+        &mut self,
+        fields_to_get: &[String],
+        take: Option<u32>,
+    ) -> Result<Vec<Vec<AvroColumnarValue>>> {
         let mut extracted_fields = Vec::new();
-        for file in &self.files {
-            let reader = Reader::new(&file.data[..])
-                .expect(&format!("Could not read Avro file {}", file.path.display()));
+        for file in &mut self.files {
+            file.file
+                .seek(std::io::SeekFrom::Start(0))
+                .into_diagnostic()?;
+            let reader = Reader::new(&file.file)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("Could not read Avro file {}", file.path.display()))?;
 
             for (i, row) in reader.enumerate() {
                 if extracted_fields.len() as u32 >= take.unwrap_or(u32::max_value()) {
                     break;
                 }
 
-                let row = row.expect(&format!("Could not parse row {} from the Avro", i));
+                let row = row
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("Could not parse row {} from the Avro", i))?;
                 if let Value::Record(fields) = row {
                     let mut extracted_fields_for_row = Vec::new();
                     for field_name in fields_to_get {
-                        let field_value_to_insert =
-                            match fields.iter().find(|(n, _)| n == field_name) {
-                                Some((field_name, field_value)) => {
-                                    let v = field_value.clone();
-                                    AvroColumnarValue::from(field_name.to_owned(), AvroValue::from(v))
-                                },
-                                None => AvroColumnarValue::from(field_name.to_owned(), AvroValue::na())
-                            };
+                        let field_value_to_insert = match fields
+                            .iter()
+                            .find(|(n, _)| n == field_name)
+                        {
+                            Some((field_name, field_value)) => {
+                                let v = field_value.clone();
+                                AvroColumnarValue::from(field_name.to_owned(), AvroValue::from(v))
+                            }
+                            None => AvroColumnarValue::from(field_name.to_owned(), AvroValue::na()),
+                        };
                         extracted_fields_for_row.push(field_value_to_insert);
                     }
                     extracted_fields.push(extracted_fields_for_row);
                 }
             }
         }
-        extracted_fields
+
+        Ok(extracted_fields)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -142,17 +156,23 @@ mod tests {
     #[test]
     fn test_get_all_field_names() {
         println!("asdas");
-        let path_to_test_avro = Path::new("./test_assets/bttf.avro").to_str().unwrap().to_owned();
-        let cli = CliService::from(path_to_test_avro, None);
-        let field_names = cli.get_all_field_names();
+        let path_to_test_avro = Path::new("./test_assets/bttf.avro")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let mut cli = CliService::from(path_to_test_avro).unwrap();
+        let field_names = cli.get_all_field_names().unwrap();
         assert_eq!(field_names, vec!["firstName", "lastName", "age"]);
     }
 
     #[test]
     fn test_get_fields() {
         println!("asdas");
-        let path_to_test_avro = Path::new("./test_assets/bttf.avro").to_str().unwrap().to_owned();
-        let _cli = CliService::from(path_to_test_avro, None);
+        let path_to_test_avro = Path::new("./test_assets/bttf.avro")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let _cli = CliService::from(path_to_test_avro).unwrap();
         // let field_names = cli.get_fields(vec!["firstName", "age"], None);
         // assert_eq!(field_names, vec!["firstName", "lastName", "age"]);
     }
